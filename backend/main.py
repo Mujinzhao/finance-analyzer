@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 import shutil
 from datetime import datetime
@@ -35,6 +36,7 @@ from models.database import (
 )
 from parsers.excel_parser import generate_template, parse_excel
 from parsers.pdf_parser import parse_pdf
+from scrapers import scrape_company
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -43,6 +45,16 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 TEMPLATE_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+_scrape_log_path = LOG_DIR / "scrape.log"
+
+logger = logging.getLogger("finance_analyzer")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    fh = logging.FileHandler(_scrape_log_path, encoding="utf-8")
+    fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    logger.addHandler(fh)
+    logger.addHandler(logging.StreamHandler())  # also print to console
 
 create_tables()
 
@@ -361,7 +373,7 @@ def _build_extraction_comparison(report: FinancialReport, source_payload: Dict[s
     }
 
 
-def _upsert_report(db: Session, payload: Dict[str, Any], file_path: str) -> FinancialReport:
+def _upsert_report(db: Session, payload: Dict[str, Any], file_path: Optional[str] = None) -> FinancialReport:
     company_id = int(payload["company_id"])
     year = int(payload["year"])
     quarter = int(payload.get("quarter", 0))
@@ -378,11 +390,12 @@ def _upsert_report(db: Session, payload: Dict[str, Any], file_path: str) -> Fina
             year=year,
             quarter=quarter,
             report_type=payload.get("report_type", "annual"),
-            file_path=file_path,
+            file_path=file_path or "",
         )
         db.add(report)
 
-    report.file_path = file_path
+    if file_path:
+        report.file_path = file_path
     report.report_type = payload.get("report_type", "annual")
     for field in ALL_FINANCIAL_FIELDS:
         if field in payload:
@@ -443,6 +456,19 @@ def delete_company(company_id: int, db: Session = Depends(get_db)):
     db.delete(company)
     db.commit()
     return {"message": "删除成功"}
+
+
+@app.put("/api/companies/{company_id}")
+def update_company(company_id: int, body: CompanyCreate, db: Session = Depends(get_db)):
+    company = db.get(Company, company_id)
+    if not company:
+        raise HTTPException(status_code=404, detail="公司不存在")
+    company.name = body.name
+    company.industry = body.industry
+    company.stock_code = body.stock_code
+    db.commit()
+    db.refresh(company)
+    return {"id": company.id, "name": company.name, "industry": company.industry, "stock_code": company.stock_code}
 
 
 @app.delete("/api/reports/{report_id}")
@@ -1028,6 +1054,188 @@ def compare_companies(company_ids: str, year: Optional[int] = None, db: Session 
         })
 
     return {"year": year, "results": result}
+
+
+@app.post("/api/scrape/{company_id}")
+def scrape_company_data(company_id: int, db: Session = Depends(get_db)):
+    """从东方财富自动采集该公司所有历史财报数据"""
+    company = db.get(Company, company_id)
+    if not company:
+        raise HTTPException(status_code=404, detail="公司不存在")
+    if not company.stock_code:
+        raise HTTPException(status_code=400, detail="该公司未设置股票代码，无法自动采集")
+
+    logger.info(f"[采集] 开始: {company.name} ({company.stock_code})")
+
+    try:
+        result = scrape_company(company.stock_code, company_id)
+    except Exception as e:
+        logger.error(f"[采集] 失败: {company.name} ({company.stock_code}) - {e}")
+        raise HTTPException(status_code=500, detail=f"数据采集失败: {e}")
+
+    for err in result.get("errors", []):
+        logger.warning(f"[采集] {company.name} 部分失败: {err}")
+
+    created = 0
+    updated = 0
+    skipped = 0
+    detail: List[Dict[str, Any]] = []
+
+    for r in result["reports"]:
+        year, quarter = r["year"], r["quarter"]
+        existed = (
+            db.query(FinancialReport)
+            .filter(
+                and_(
+                    FinancialReport.company_id == company_id,
+                    FinancialReport.year == year,
+                    FinancialReport.quarter == quarter,
+                )
+            )
+            .first()
+        )
+        status = "updated" if existed else "created"
+        if existed:
+            updated += 1
+        else:
+            created += 1
+
+        fields: Dict[str, float] = r.get("fields", {})
+        if not fields:
+            if existed:
+                updated -= 1
+            else:
+                created -= 1
+            skipped += 1
+            continue
+
+        payload: Dict[str, Any] = {
+            "company_id": company_id,
+            "year": year,
+            "quarter": quarter,
+            "report_type": "annual" if quarter == 0 else "quarterly",
+        }
+        payload.update(fields)
+
+        try:
+            report = _upsert_report(db, payload)
+            detail.append({
+                "year": year,
+                "quarter": quarter,
+                "fields_count": len(fields),
+                "status": status,
+                "report_id": report.id,
+            })
+        except Exception:
+            detail.append({
+                "year": year,
+                "quarter": quarter,
+                "fields_count": len(fields),
+                "status": "failed",
+            })
+            if status == "created":
+                created -= 1
+            else:
+                updated -= 1
+
+    logger.info(
+        f"[采集] 完成: {company.name} | 共 {len(result['reports'])} 期, "
+        f"新增 {created}, 更新 {updated}, 跳过 {skipped}"
+    )
+    if result.get("errors"):
+        logger.warning(f"[采集] {company.name} 采集错误: {result['errors']}")
+
+    return {
+        "company_id": company_id,
+        "stock_code": company.stock_code,
+        "total_periods": len(result["reports"]),
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+        "detail": detail,
+        "errors": result.get("errors", []),
+    }
+
+
+@app.post("/api/scrape/batch")
+def scrape_batch(company_ids: List[int], db: Session = Depends(get_db)):
+    """批量自动采集多家公司的财报数据"""
+    logger.info(f"[批量采集] 开始: {len(company_ids)} 家公司")
+    results: List[Dict[str, Any]] = []
+    total_created = 0
+    total_updated = 0
+
+    for cid in company_ids:
+        try:
+            company = db.get(Company, cid)
+            if not company or not company.stock_code:
+                logger.warning(f"[批量采集] 跳过公司 {cid}: 不存在或无股票代码")
+                results.append({"company_id": cid, "success": False, "error": "公司不存在或无股票代码"})
+                continue
+
+            logger.info(f"[批量采集] 正在处理: {company.name} ({company.stock_code})")
+            result = scrape_company(company.stock_code, cid)
+            batch_created = 0
+            batch_updated = 0
+
+            for r in result["reports"]:
+                year, quarter = r["year"], r["quarter"]
+                existed = (
+                    db.query(FinancialReport)
+                    .filter(
+                        and_(
+                            FinancialReport.company_id == cid,
+                            FinancialReport.year == year,
+                            FinancialReport.quarter == quarter,
+                        )
+                    )
+                    .first()
+                )
+                if existed:
+                    batch_updated += 1
+                else:
+                    batch_created += 1
+
+                fields = r.get("fields", {})
+                if not fields:
+                    continue
+
+                payload: Dict[str, Any] = {
+                    "company_id": cid,
+                    "year": year,
+                    "quarter": quarter,
+                    "report_type": "annual" if quarter == 0 else "quarterly",
+                }
+                payload.update(fields)
+                _upsert_report(db, payload)
+
+            total_created += batch_created
+            total_updated += batch_updated
+            logger.info(
+                f"[批量采集] {company.name} 完成: "
+                f"新增 {batch_created}, 更新 {batch_updated}"
+            )
+            results.append({
+                "company_id": cid,
+                "stock_code": company.stock_code,
+                "success": True,
+                "created": batch_created,
+                "updated": batch_updated,
+            })
+        except Exception as e:
+            logger.error(f"[批量采集] 公司 {cid} 失败: {e}")
+            results.append({"company_id": cid, "success": False, "error": str(e)})
+
+    logger.info(
+        f"[批量采集] 全部完成: {len(company_ids)} 家, "
+        f"总计新增 {total_created}, 更新 {total_updated}"
+    )
+
+    return {
+        "results": results,
+        "total_created": total_created,
+        "total_updated": total_updated,
+    }
 
 
 @app.get("/api/logs")

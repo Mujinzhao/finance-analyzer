@@ -7,6 +7,7 @@ const api = axios.create({
 export const companyApi = {
   list: () => api.get('/api/companies').then((r) => r.data),
   create: (data: { name: string; industry?: string; stock_code?: string }) => api.post('/api/companies', data).then((r) => r.data),
+  update: (id: number, data: { name: string; industry?: string; stock_code?: string }) => api.put(`/api/companies/${id}`, data).then((r) => r.data),
   delete: (id: number) => api.delete(`/api/companies/${id}`).then((r) => r.data),
 };
 
@@ -85,3 +86,8 @@ export const aiApi = {
 };
 
 export default api;
+
+export const scrapeApi = {
+  single: (companyId: number) => api.post(`/api/scrape/${companyId}`).then((r) => r.data),
+  batch: (companyIds: number[]) => api.post("/api/scrape/batch", companyIds).then((r) => r.data),
+};

@@ -23,10 +23,10 @@ import {
   Row,
   Col,
 } from 'antd';
-import { ArrowLeftOutlined, DeleteOutlined, DownloadOutlined, EditOutlined, EyeOutlined, PlusOutlined, SaveOutlined, UploadOutlined } from '@ant-design/icons';
+import { ArrowLeftOutlined, CloudDownloadOutlined, DeleteOutlined, DownloadOutlined, EditOutlined, EyeOutlined, PlusOutlined, SaveOutlined, UploadOutlined } from '@ant-design/icons';
 
 import { Company, ReportDetail, ReportMeta } from '../../types';
-import { companyApi, reportApi } from '../../utils/api';
+import { companyApi, reportApi, scrapeApi } from '../../utils/api';
 import { formatMoney, reportPeriodLabel } from '../../utils/format';
 
 interface Props {
@@ -57,6 +57,7 @@ function parseFilenamePeriod(filename: string): { year: number; quarter: number 
 
 const UploadPage: React.FC<Props> = ({ companies, onRefresh }) => {
   const [companyModal, setCompanyModal] = useState(false);
+  const [editingCompany, setEditingCompany] = useState<Company | null>(null);
   const [uploadModal, setUploadModal] = useState(false);
   const [editDrawer, setEditDrawer] = useState(false);
   const [detailCompanyId, setDetailCompanyId] = useState<number | null>(null);
@@ -66,6 +67,7 @@ const UploadPage: React.FC<Props> = ({ companies, onRefresh }) => {
   const [changedFields, setChangedFields] = useState<Record<string, number>>({});
   const [saving, setSaving] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [scraping, setScraping] = useState<number | null>(null);
 
   const [form] = Form.useForm();
   const detailCompany = useMemo(() => companies.find((item) => item.id === detailCompanyId) || null, [companies, detailCompanyId]);
@@ -96,9 +98,15 @@ const UploadPage: React.FC<Props> = ({ companies, onRefresh }) => {
 
   const submitCompany = async () => {
     const values = await form.validateFields();
-    await companyApi.create(values);
-    message.success('公司已创建');
+    if (editingCompany) {
+      await companyApi.update(editingCompany.id, values);
+      message.success('公司已更新');
+    } else {
+      await companyApi.create(values);
+      message.success('公司已创建');
+    }
     setCompanyModal(false);
+    setEditingCompany(null);
     form.resetFields();
     await onRefresh();
   };
@@ -147,6 +155,22 @@ const UploadPage: React.FC<Props> = ({ companies, onRefresh }) => {
       message.warning(`上传完成: ${ok} 成功, ${fail} 失败`);
     }
     await onRefresh();
+  };
+
+  const doScrape = async (companyId: number, companyName: string) => {
+    setScraping(companyId);
+    try {
+      const result = await scrapeApi.single(companyId);
+      message.success(
+        `${companyName} 采集完成: 新增 ${result.created} 份, 更新 ${result.updated} 份`,
+        8,
+      );
+      await onRefresh();
+    } catch (e: any) {
+      message.error(e?.response?.data?.detail || e?.message || '采集失败');
+    } finally {
+      setScraping(null);
+    }
   };
 
   const removeCompany = async (id: number) => {
@@ -234,6 +258,26 @@ const UploadPage: React.FC<Props> = ({ companies, onRefresh }) => {
         <Space>
           <Button icon={<EyeOutlined />} onClick={() => setDetailCompanyId(row.id)}>详情</Button>
           <Button type="primary" icon={<UploadOutlined />} onClick={() => openUploadModal(row.id)}>上传</Button>
+          <Tooltip title={!row.stock_code ? '请先设置股票代码' : '从东方财富自动拉取历史财报数据'}>
+            <Button
+              loading={scraping === row.id}
+              icon={<CloudDownloadOutlined />}
+              disabled={!row.stock_code || scraping !== null}
+              onClick={() => doScrape(row.id, row.name)}
+            >
+              自动采集
+            </Button>
+          </Tooltip>
+          <Button
+            icon={<EditOutlined />}
+            onClick={() => {
+              setEditingCompany(row);
+              form.setFieldsValue({ name: row.name, industry: row.industry, stock_code: row.stock_code });
+              setCompanyModal(true);
+            }}
+          >
+            编辑
+          </Button>
           <Button danger onClick={() => removeCompany(row.id)}>删除</Button>
         </Space>
       ),
@@ -271,7 +315,7 @@ const UploadPage: React.FC<Props> = ({ companies, onRefresh }) => {
           </Typography.Paragraph>
         </div>
         <Space>
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => setCompanyModal(true)}>新建公司</Button>
+          <Button type="primary" icon={<PlusOutlined />} onClick={() => { setEditingCompany(null); form.resetFields(); setCompanyModal(true); }}>新建公司</Button>
           <Button
             icon={<DownloadOutlined />}
             onClick={async () => {
@@ -323,6 +367,26 @@ const UploadPage: React.FC<Props> = ({ companies, onRefresh }) => {
           </div>
           <Space wrap>
             <Button type="primary" icon={<UploadOutlined />} onClick={() => openUploadModal(detailCompany.id)}>新增报表</Button>
+            <Tooltip title={!detailCompany.stock_code ? '请先设置股票代码' : '从东方财富自动拉取历史财报数据'}>
+              <Button
+                loading={scraping === detailCompany.id}
+                icon={<CloudDownloadOutlined />}
+                disabled={!detailCompany.stock_code || scraping !== null}
+                onClick={() => doScrape(detailCompany.id, detailCompany.name)}
+              >
+                自动采集
+              </Button>
+            </Tooltip>
+            <Button
+              icon={<EditOutlined />}
+              onClick={() => {
+                setEditingCompany(detailCompany);
+                form.setFieldsValue({ name: detailCompany.name, industry: detailCompany.industry, stock_code: detailCompany.stock_code });
+                setCompanyModal(true);
+              }}
+            >
+              编辑信息
+            </Button>
             <Popconfirm title="删除当前公司？" description="会一并删除该公司全部报表。" okText="删除" cancelText="取消" onConfirm={() => removeCompany(detailCompany.id)}>
               <Button danger icon={<DeleteOutlined />}>删除公司</Button>
             </Popconfirm>
@@ -378,7 +442,12 @@ const UploadPage: React.FC<Props> = ({ companies, onRefresh }) => {
     <div>
       {detailCompanyId ? renderDetailView() : renderListView()}
 
-      <Modal title="新建公司" open={companyModal} onCancel={() => setCompanyModal(false)} onOk={submitCompany}>
+      <Modal
+        title={editingCompany ? '编辑公司' : '新建公司'}
+        open={companyModal}
+        onCancel={() => { setCompanyModal(false); setEditingCompany(null); form.resetFields(); }}
+        onOk={submitCompany}
+      >
         <Form layout="vertical" form={form}>
           <Form.Item label="公司名称" name="name" rules={[{ required: true, message: '请输入公司名称' }]}><Input /></Form.Item>
           <Form.Item label="行业" name="industry"><Input /></Form.Item>
