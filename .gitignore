@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+*.egg
+
+# Database
+*.db
+
+# Logs
+*.log
+logs/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+*:Zone.Identifier
+
+# Node / Frontend
+node_modules/
+frontend/build/
+frontend/dist/
+
+# Environment / Secrets
+.env
+.env.local
+.env.*.local
+
+# Runtime
+.run/
+*.pid
+
+# Temp / Misc
+=*
+.claude/
