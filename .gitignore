@@ -39,6 +39,13 @@ frontend/dist/
 .run/
 *.pid
 
+# Uploads & Virtualenv
+backend/uploads/
+backend/venv/
+
+# Books / Docs
+/*.txt
+
 # Temp / Misc
 =*
 .claude/
